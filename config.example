@@ -1,0 +1,17 @@
+# hdmi-resolution settings, normally written by hdmi-resolution-tui.
+# One setting per line, written exactly as below (no spaces around "=").
+# The file is read as data: anything else is ignored with a warning in the log.
+
+# Mirror rule master switch: 1 = on, 0 = off.
+enabled=1
+
+# Laptop screen mode used while an external display mirrors it.
+target_width=1920
+target_height=1080
+
+# Extend rule (single display above the laptop screen, centred): 1 = on, 0 = off.
+extend_top_center=1
+
+# Displays excluded from the mirror rule, one line each: key, then a label.
+# `hdmi-resolution status` prints the key of every connected display.
+# auto_off_display=edid:0123456789abcdef0123456789abcdef Example Monitor [HDMI]

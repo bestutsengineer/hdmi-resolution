@@ -1,0 +1,477 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2016  # jq programs are single-quoted on purpose
+set -u
+
+# Plasma/Wayland display rules for the laptop panel and external displays of
+# any connector type (HDMI, USB-C/DisplayPort, DVI, VGA, ...).
+#
+#   Mirror rule: while an external display mirrors the panel, the panel is
+#     switched to the configured target mode. The user's own mode is restored
+#     when mirroring ends. Can be switched off globally or per display.
+#   Extend rule: when exactly one external display is extended, it is placed
+#     above the panel, horizontally centred.
+#
+# Usage: hdmi-resolution [run|status|list-displays]
+#
+# The name is historical; the first version only handled HDMI.
+# How it works and how to change it safely: docs/DESIGN.md in the repository.
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hdmi-resolution"
+CONFIG_FILE="$CONFIG_DIR/config"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/hdmi-resolution"
+BASELINE_FILE="$STATE_DIR/baseline-mode"
+PENDING_FILE="$STATE_DIR/pending-mode"
+WATCH_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/kwinoutputconfig.json"
+PNP_IDS=/usr/share/hwdata/pnp.ids
+
+# Test hooks: the test suite points these at a mock and a fake sysfs tree.
+KSCREEN_DOCTOR="${HDMI_RESOLUTION_KSCREEN_DOCTOR:-kscreen-doctor}"
+DRM_DIR="${HDMI_RESOLUTION_DRM_DIR:-/sys/class/drm}"
+
+log() {
+    printf '[%s] %s\n' "$(date '+%F %T%z')" "$*" >&2
+}
+
+mkdir -p "$STATE_DIR"
+enabled=1
+target_width=1920
+target_height=1080
+extend_top_center=1
+# Displays with the mirror rule switched off, one '<key> <label>' per entry.
+auto_off_displays=()
+
+# The config is read as data and never executed. Each line must be exactly
+# one known setting; anything else is ignored with a warning.
+# Keep in step with load_config in hdmi-resolution-tui.
+load_config() {
+    local line n=0
+    local switch='^(enabled|extend_top_center)=([01])$'
+    local size='^(target_width|target_height)=([0-9]{3,5})$'
+    local display='^auto_off_display=((edid:[0-9a-f]{32}|connector:[A-Za-z0-9_-]{1,40})( [[:print:]]{0,100})?)$'
+    [[ -r "$CONFIG_FILE" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1))
+        if [[ "$line" =~ $switch || "$line" =~ $size ]]; then
+            printf -v "${BASH_REMATCH[1]}" '%s' "${BASH_REMATCH[2]}"
+        elif [[ "$line" =~ $display ]]; then
+            auto_off_displays+=("${BASH_REMATCH[1]}")
+        elif [[ -n "$line" && "$line" != '#'* ]]; then
+            log "WARNING: ignoring line $n of $CONFIG_FILE"
+        fi
+    done < "$CONFIG_FILE"
+}
+load_config
+
+# Shared jq helpers. The panel is recognised by its kernel connector name;
+# every other connected and enabled output counts as an external display.
+# "logical" is the size an output occupies in the desktop layout: its mode
+# size, swapped when rotated by 90 degrees, divided by its scale.
+JQ_DEFS='
+def is_panel: .name | test("^(eDP|LVDS|DSI)-");
+def panel: [.outputs[] | select(is_panel)] | .[0];
+def externals: [.outputs[] | select((is_panel | not) and .connected == true and .enabled == true)];
+def current_mode: . as $o | [$o.modes[] | select(.id == $o.currentModeId)] | .[0];
+def logical:
+  . as $o
+  | (current_mode | .size) as $m
+  | (if ($o.rotation == 2 or $o.rotation == 8 or $o.rotation == 32 or $o.rotation == 128)
+     then {w: $m.height, h: $m.width} else {w: $m.width, h: $m.height} end) as $s
+  | {w: (($s.w / $o.scale) | round), h: (($s.h / $o.scale) | round)};
+def mirrors($p):
+  .replicationSource == $p.id or $p.replicationSource == .id
+  or (.pos.x == $p.pos.x and .pos.y == $p.pos.y);
+'
+
+snapshot=''
+layout='unknown'
+panel=''
+ext_names=''
+mirror_names=''
+
+doctor() { timeout 20 "$KSCREEN_DOCTOR" "$@" 2>/dev/null; }
+
+snap() { jq -r "$@" <<< "$snapshot" 2>/dev/null; }
+
+# Query Plasma once and derive the layout facts every rule works from.
+refresh_snapshot() {
+    local -a facts
+    snapshot=$(doctor -j)
+    mapfile -t facts < <(snap "$JQ_DEFS"'
+      panel as $p
+      | externals as $e
+      | (if $p == null or $p.enabled != true then "panel-off"
+         elif ($e | length) == 0 then "no-display"
+         elif any($e[]; mirrors($p)) then "mirror"
+         else "extend" end) as $layout
+      | $layout,
+        ($p.name // ""),
+        ($e | map(.name) | join(" ")),
+        (if $layout == "mirror" then $e | map(select(mirrors($p)) | .name) | join(" ") else "" end)')
+    layout=${facts[0]:-unknown}
+    panel=${facts[1]:-}
+    ext_names=${facts[2]:-}
+    mirror_names=${facts[3]:-}
+}
+
+# --- Display identity -------------------------------------------------------
+
+connector_kind() {
+    case "$1" in
+        HDMI-*) echo 'HDMI' ;;
+        DP-*) echo 'USB-C/DisplayPort' ;;
+        DVI-*) echo 'DVI' ;;
+        VGA-*) echo 'VGA' ;;
+        Virtual-*) echo 'Virtual' ;;
+        eDP-*|LVDS-*|DSI-*) echo 'Built-in' ;;
+        *) echo "${1%%-*}" ;;
+    esac
+}
+
+# First readable, non-empty EDID blob for a connector name such as DP-3.
+edid_file() {
+    local f
+    # The name ends up in a path, so accept nothing that could leave DRM_DIR.
+    [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    for f in "$DRM_DIR"/card*-"$1"/edid; do
+        [[ -r "$f" ]] || continue
+        [[ -n "$(od -An -N1 -tu1 "$f" 2>/dev/null)" ]] && { printf '%s\n' "$f"; return 0; }
+    done
+    return 1
+}
+
+# Stable identity of a display: the hash of its EDID, which is the same value
+# KWin stores as edidHash, so it follows the monitor from port to port.
+display_key() {
+    local f sum
+    if f=$(edid_file "$1"); then
+        sum=$(md5sum < "$f" 2>/dev/null | cut -d' ' -f1)
+        [[ "$sum" =~ ^[0-9a-f]{32}$ ]] && { printf 'edid:%s\n' "$sum"; return 0; }
+    fi
+    printf 'connector:%s\n' "$1"
+}
+
+# Human-readable model: the EDID monitor name, else vendor and product code.
+display_model() {
+    local f off i ch name='' pnp vendor
+    local -a b=()
+    if f=$(edid_file "$1"); then
+        read -r -d '' -a b < <(od -An -v -tu1 "$f" 2>/dev/null)
+    fi
+    if (( ${#b[@]} < 128 )); then
+        echo 'Unidentified display'
+        return 0
+    fi
+    for off in 54 72 90 108; do
+        # Display descriptor 0xFC (252) carries the monitor name.
+        (( b[off] == 0 && b[off + 1] == 0 && b[off + 2] == 0 && b[off + 3] == 252 )) || continue
+        for (( i = off + 5; i < off + 18; i++ )); do
+            (( b[i] == 10 )) && break
+            (( b[i] >= 32 && b[i] < 127 )) || continue
+            # shellcheck disable=SC2059
+            printf -v ch "\\$(printf '%03o' "${b[i]}")"
+            name+=$ch
+        done
+    done
+    name=${name%"${name##*[! ]}"}
+    if [[ -z "$name" ]]; then
+        i=$(( b[8] << 8 | b[9] ))
+        # Bytes 8-9 pack the three-letter PNP vendor ID, five bits per letter.
+        pnp=''
+        for off in 10 5 0; do
+            # shellcheck disable=SC2059
+            printf -v ch "\\$(printf '%03o' $(( (i >> off & 31) + 64 )))"
+            pnp+=$ch
+        done
+        [[ "$pnp" =~ ^[A-Z]{3}$ ]] || pnp='???'
+        vendor=$(awk -F'\t' -v id="$pnp" '$1 == id { print $2; exit }' "$PNP_IDS" 2>/dev/null | LC_ALL=C tr -cd ' -~')
+        name=$(printf '%s %04X' "${vendor:-$pnp}" $(( b[11] << 8 | b[10] )))
+    fi
+    printf '%s\n' "${name:0:60}"
+}
+
+display_description() {
+    printf '%s: %s, %s' "$1" "$(display_model "$1")" "$(connector_kind "$1")"
+}
+
+is_auto_off() {
+    local entry
+    for entry in "${auto_off_displays[@]}"; do
+        [[ "${entry%% *}" == "$1" ]] && return 0
+    done
+    return 1
+}
+
+# True when the mirror rule should drive the panel: the master switch is on
+# and at least one mirroring display has not been switched off.
+mirror_rule_wanted() {
+    local name
+    local -a names
+    [[ "$enabled" == 1 ]] || return 1
+    read -r -a names <<< "$mirror_names"
+    for name in "${names[@]}"; do
+        is_auto_off "$(display_key "$name")" || return 0
+    done
+    return 1
+}
+
+# --- Mirror rule ------------------------------------------------------------
+
+panel_mode_spec() {
+    snap "$JQ_DEFS"'panel | current_mode | [.size.width, .size.height, .refreshRate] | @tsv'
+}
+
+# Mode IDs are renumbered by Plasma when outputs come and go, so they are
+# always resolved from a fresh snapshot and never stored.
+panel_mode_id_for_size() {
+    snap --argjson width "$1" --argjson height "$2" "$JQ_DEFS"'
+      panel | (current_mode | .refreshRate) as $now
+      | [.modes[] | select(.size.width == $width and .size.height == $height)]
+      | sort_by((.refreshRate - $now) | fabs) | .[0].id // empty'
+}
+
+panel_mode_id_for_spec() {
+    snap --argjson width "$1" --argjson height "$2" --argjson refresh "$3" "$JQ_DEFS"'
+      panel
+      | [.modes[] | select(.size.width == $width and .size.height == $height
+                           and ((.refreshRate - $refresh) | fabs) < 0.2)]
+      | sort_by((.refreshRate - $refresh) | fabs) | .[0].id // empty'
+}
+
+valid_mode_spec() {
+    [[ "$1" =~ ^[0-9]+$ && "$2" =~ ^[0-9]+$ && "$3" =~ ^[0-9.]+$ ]]
+}
+
+save_baseline_mode() {
+    local mode_spec width height refresh
+    mode_spec=$(panel_mode_spec)
+    read -r width height refresh <<< "$mode_spec"
+    valid_mode_spec "$width" "$height" "$refresh" || return 0
+    [[ -r "$BASELINE_FILE" && "$(<"$BASELINE_FILE")" == "$mode_spec" ]] && return 0
+    printf '%s\n' "$mode_spec" > "$BASELINE_FILE"
+}
+
+save_pending_mode() {
+    local mode_spec width height refresh
+    if [[ -r "$BASELINE_FILE" ]]; then
+        mode_spec=$(<"$BASELINE_FILE")
+    else
+        mode_spec=$(panel_mode_spec)
+    fi
+    read -r width height refresh <<< "$mode_spec"
+    valid_mode_spec "$width" "$height" "$refresh" || return 0
+    printf '%s\n' "$mode_spec" > "$PENDING_FILE"
+}
+
+apply_mirror_mode() {
+    local mode_id rc
+    mode_id=$(panel_mode_id_for_size "$target_width" "$target_height")
+    if [[ -z "$mode_id" ]]; then
+        log "ERROR: $panel has no ${target_width}x${target_height} mode"
+        return 1
+    fi
+    doctor "output.$panel.mode.$mode_id" >/dev/null
+    rc=$?
+    if ((rc == 0)); then
+        log "Applied mirrored panel mode ${target_width}x${target_height} (mode id $mode_id)"
+        refresh_snapshot
+    else
+        log "ERROR: kscreen-doctor failed applying panel mode id $mode_id (exit $rc)"
+    fi
+    return "$rc"
+}
+
+restore_user_mode() {
+    local width height refresh mode_id rc
+    [[ -r "$PENDING_FILE" ]] || { log 'No pending user mode to restore'; return 0; }
+    read -r width height refresh < "$PENDING_FILE"
+    if ! valid_mode_spec "$width" "$height" "$refresh"; then
+        log 'ERROR: discarding unreadable pending user mode'
+        rm -f "$PENDING_FILE"
+        return 1
+    fi
+    mode_id=$(panel_mode_id_for_spec "$width" "$height" "$refresh")
+    if [[ -z "$mode_id" ]]; then
+        log "ERROR: saved user mode ${width}x${height}@${refresh} is unavailable"
+        return 1
+    fi
+    doctor "output.$panel.mode.$mode_id" >/dev/null
+    rc=$?
+    if ((rc != 0)); then
+        log "ERROR: kscreen-doctor failed restoring panel mode id $mode_id (exit $rc)"
+        return "$rc"
+    fi
+    log "Restored user panel mode ${width}x${height}@${refresh} (mode id $mode_id)"
+    rm -f "$PENDING_FILE"
+    refresh_snapshot
+}
+
+# --- Extend rule ------------------------------------------------------------
+
+last_extend_sig=''
+last_applied_pos=''
+
+# Prints "<external x,y> <panel x,y> <target external x,y> <target panel x,y>".
+# All coordinates stay non-negative: the wider output starts at x=0 and the
+# narrower one is centred against it; the panel sits directly below.
+placement_geometry() {
+    snap --arg ext "$1" "$JQ_DEFS"'
+      panel as $p
+      | ([externals[] | select(.name == $ext)] | .[0]) as $x
+      | ($p | logical) as $pl
+      | ($x | logical) as $xl
+      | ([$pl.w, $xl.w] | max) as $w
+      | "\($x.pos.x),\($x.pos.y) \($p.pos.x),\($p.pos.y) \((($w - $xl.w) / 2) | floor),0 \((($w - $pl.w) / 2) | floor),\($xl.h)"'
+}
+
+# The placement is applied when a single extended display appears (plug-in,
+# leaving mirror mode, service start). Afterwards it is only refreshed while
+# the outputs still sit where this service put them, so a layout the user
+# drags by hand is left alone until the next time extend mode is entered.
+place_extended_display() {
+    local ext sig ext_pos panel_pos ext_target panel_target entered=0
+    local -a names
+    read -r -a names <<< "$ext_names"
+    if [[ "$extend_top_center" != 1 || "$layout" != extend || ${#names[@]} -ne 1 || "${names[0]}" == Virtual-* ]]; then
+        last_extend_sig=''
+        last_applied_pos=''
+        return 0
+    fi
+    ext=${names[0]}
+    read -r ext_pos panel_pos ext_target panel_target <<< "$(placement_geometry "$ext")"
+    if [[ -z "$panel_target" ]]; then
+        log "ERROR: could not work out the geometry of $ext and $panel"
+        return 1
+    fi
+    sig="$ext $(display_key "$ext")"
+    [[ "$sig" != "$last_extend_sig" ]] && entered=1
+    last_extend_sig=$sig
+    ((entered)) || [[ "$ext_pos $panel_pos" == "$last_applied_pos" ]] || return 0
+    if [[ "$ext_pos $panel_pos" == "$ext_target $panel_target" ]]; then
+        ((entered)) && log "$ext is already above $panel and centred"
+        last_applied_pos="$ext_target $panel_target"
+        return 0
+    fi
+    if doctor "output.$ext.position.$ext_target" "output.$panel.position.$panel_target" >/dev/null; then
+        log "Placed $ext above $panel, centred ($ext at $ext_target, $panel at $panel_target)"
+        last_applied_pos="$ext_target $panel_target"
+    else
+        log "ERROR: kscreen-doctor failed placing $ext above $panel"
+        last_applied_pos=''
+    fi
+}
+
+# --- Commands ---------------------------------------------------------------
+
+describe_externals() {
+    local name out=''
+    local -a names
+    read -r -a names <<< "$ext_names"
+    for name in "${names[@]}"; do
+        out+="${out:+; }$(display_description "$name")"
+    done
+    printf '%s' "$out"
+}
+
+run_daemon() {
+    local last_watch_stamp='' watch_stamp state last_state='' displays
+    log "Started: mirror_rule=$enabled target=${target_width}x${target_height} extend_rule=$extend_top_center displays_off=${#auto_off_displays[@]} watch=$WATCH_FILE"
+    while :; do
+        if [[ -r "$WATCH_FILE" ]]; then
+            watch_stamp=$(stat -c '%y:%s:%i' "$WATCH_FILE" 2>/dev/null || true)
+        else
+            watch_stamp='missing'
+        fi
+        if [[ "$watch_stamp" == "$last_watch_stamp" ]]; then
+            sleep 1
+            continue
+        fi
+        last_watch_stamp="$watch_stamp"
+        refresh_snapshot
+        state=$layout
+        # Mirroring with the rule switched off: the panel mode is the user's.
+        [[ "$state" == mirror ]] && ! mirror_rule_wanted && state='mirror-manual'
+        log "Display configuration changed; layout=$state"
+        if [[ "$state" != "$last_state" ]]; then
+            displays=$(describe_externals)
+            log "Layout changed: ${last_state:-initial} -> $state${displays:+ [$displays]}"
+        fi
+        case "$state" in
+            unknown)
+                [[ "$state" != "$last_state" ]] && log 'ERROR: could not determine display layout from kscreen-doctor'
+                ;;
+            panel-off)
+                # The panel is off or absent; leave everything as it is.
+                ;;
+            mirror)
+                if [[ "$last_state" != mirror ]]; then
+                    save_pending_mode
+                    apply_mirror_mode
+                fi
+                ;;
+            *)
+                # no-display, extend, mirror-manual: finish any restore that
+                # is still owed, otherwise track the user's current setting.
+                if [[ -r "$PENDING_FILE" ]]; then
+                    restore_user_mode
+                else
+                    save_baseline_mode
+                fi
+                ;;
+        esac
+        place_extended_display
+        last_state="$state"
+        sleep 1
+    done
+}
+
+# One line per connected external display, tab-separated and never empty:
+# key, connector, connector kind, model, state, mirror rule (on/off).
+list_displays() {
+    local name state key auto
+    refresh_snapshot
+    while IFS=$'\t' read -r name state; do
+        [[ -n "$name" ]] || continue
+        key=$(display_key "$name")
+        auto=on
+        is_auto_off "$key" && auto=off
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$key" "$name" "$(connector_kind "$name")" "$(display_model "$name")" "$state" "$auto"
+    done < <(snap "$JQ_DEFS"'
+      panel as $p
+      | .outputs[] | select((is_panel | not) and .connected == true)
+      | [.name, (if .enabled != true then "disabled"
+                 elif $p != null and $p.enabled == true and mirrors($p) then "mirrored"
+                 else "extended" end)] | @tsv')
+}
+
+show_status() {
+    local key name kind model state auto found=0
+    refresh_snapshot
+    printf 'Service:      %s\n' "$(systemctl --user is-active hdmi-resolution.service 2>/dev/null)"
+    printf 'Layout:       %s\n' "$layout"
+    printf 'Panel:        %s %s\n' "${panel:-none}" "$(snap "$JQ_DEFS"'
+      panel | select(. != null) | (current_mode) as $m | logical as $l
+      | "\($m.size.width)x\($m.size.height) scale \(.scale), occupies \($l.w)x\($l.h) at \(.pos.x),\(.pos.y)\(if .enabled then "" else ", off" end)"')"
+    printf 'Displays:\n'
+    while IFS=$'\t' read -r key name kind model state auto; do
+        found=1
+        printf '  %s: %s [%s] %s, %s, mirror rule %s (%s)\n' "$name" "$model" "$kind" "$(snap --arg n "$name" "$JQ_DEFS"'
+          .outputs[] | select(.name == $n) | (current_mode) as $m | logical as $l
+          | "\($m.size.width)x\($m.size.height) scale \(.scale), occupies \($l.w)x\($l.h) at \(.pos.x),\(.pos.y)"')" "$state" "$auto" "$key"
+    done < <(list_displays)
+    ((found)) || printf '  none connected\n'
+    printf 'Mirror rule:  %s, target %sx%s\n' "$([[ "$enabled" == 1 ]] && echo on || echo off)" "$target_width" "$target_height"
+    printf 'Extend rule:  %s (single display above the panel, centred)\n' "$([[ "$extend_top_center" == 1 ]] && echo on || echo off)"
+    [[ -r "$BASELINE_FILE" ]] && printf 'User mode:    %s\n' "$(tr '\t' ' ' < "$BASELINE_FILE")"
+    [[ -r "$PENDING_FILE" ]] && printf 'To restore:   %s\n' "$(tr '\t' ' ' < "$PENDING_FILE")"
+    return 0
+}
+
+case "${1:-run}" in
+    run) run_daemon ;;
+    status) show_status ;;
+    list-displays) list_displays ;;
+    *)
+        echo "Usage: ${0##*/} [run|status|list-displays]" >&2
+        exit 2
+        ;;
+esac

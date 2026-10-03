@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Stand-in for kscreen-doctor, used only by run-tests.sh.
+#
+# The fake display state lives in $MOCK_DIR/state.json in the same shape as
+# `kscreen-doctor -j`. Mode and position settings are applied to that file,
+# and, like KWin, every applied change rewrites kwinoutputconfig.json so the
+# service notices it. Every non-query call is appended to $MOCK_DIR/calls.log.
+#
+# Switches (create the file to turn on):
+#   $MOCK_DIR/broken      -j prints something that is not JSON
+#   $MOCK_DIR/fail-apply  every setting is refused with exit status 1
+set -u
+
+state="$MOCK_DIR/state.json"
+
+if [[ "${1:-}" == -j ]]; then
+    if [[ -e "$MOCK_DIR/broken" ]]; then
+        echo 'kscreen-doctor: no backend'
+    else
+        cat "$state"
+    fi
+    exit 0
+fi
+
+printf '%s\n' "$*" >> "$MOCK_DIR/calls.log"
+[[ -e "$MOCK_DIR/fail-apply" ]] && exit 1
+
+json=$(<"$state")
+for arg in "$@"; do
+    IFS=. read -r _ name setting value <<< "$arg"
+    case "$setting" in
+        mode)
+            json=$(jq -c --arg n "$name" --arg v "$value" '
+              if any(.outputs[]; .name == $n and any(.modes[]; .id == $v))
+              then (.outputs[] | select(.name == $n) | .currentModeId) = $v
+              else error("unknown output or mode") end' <<< "$json" 2>/dev/null) || exit 1
+            ;;
+        position)
+            json=$(jq -c --arg n "$name" --argjson x "${value%,*}" --argjson y "${value#*,}" '
+              if any(.outputs[]; .name == $n)
+              then (.outputs[] | select(.name == $n) | .pos) = {x: $x, y: $y}
+              else error("unknown output") end' <<< "$json" 2>/dev/null) || exit 1
+            ;;
+        *)
+            exit 1
+            ;;
+    esac
+done
+printf '%s\n' "$json" > "$state.tmp" && mv "$state.tmp" "$state"
+date +%s%N > "$XDG_CONFIG_HOME/kwinoutputconfig.json"

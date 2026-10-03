@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+set -u
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hdmi-resolution"
+CONFIG_FILE="$CONFIG_DIR/config"
+DAEMON="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/hdmi-resolution"
+mkdir -p "$CONFIG_DIR"
+
+enabled=1
+target_width=1920
+target_height=1080
+extend_top_center=1
+auto_off_displays=()
+
+# The config is read as data and never executed. Lines that are not exactly
+# one known setting are ignored; saving rewrites the file cleanly.
+# Keep in step with load_config in hdmi-resolution.
+load_config() {
+    local line
+    local switch='^(enabled|extend_top_center)=([01])$'
+    local size='^(target_width|target_height)=([0-9]{3,5})$'
+    local display='^auto_off_display=((edid:[0-9a-f]{32}|connector:[A-Za-z0-9_-]{1,40})( [[:print:]]{0,100})?)$'
+    [[ -r "$CONFIG_FILE" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ $switch || "$line" =~ $size ]]; then
+            printf -v "${BASH_REMATCH[1]}" '%s' "${BASH_REMATCH[2]}"
+        elif [[ "$line" =~ $display ]]; then
+            auto_off_displays+=("${BASH_REMATCH[1]}")
+        fi
+    done < "$CONFIG_FILE"
+}
+load_config
+
+# Displays offered in the menu: everything connected now, plus displays whose
+# mirror rule was switched off earlier and that are not connected right now.
+# off[key] is set for every display with the mirror rule switched off.
+d_key=()
+d_label=()
+d_state=()
+declare -A off=()
+
+load_displays() {
+    local key name kind model state entry known k
+    while IFS=$'\t' read -r key name kind model state _; do
+        d_key+=("$key")
+        d_label+=("$model [$kind]")
+        d_state+=("$name, $state")
+    done < <("$DAEMON" list-displays 2>/dev/null)
+    for entry in "${auto_off_displays[@]}"; do
+        key=${entry%% *}
+        off[$key]=1
+        known=0
+        for k in "${d_key[@]}"; do
+            [[ "$k" == "$key" ]] && known=1
+        done
+        if ((!known)); then
+            d_key+=("$key")
+            d_label+=("${entry#* }")
+            d_state+=('not connected')
+        fi
+    done
+}
+
+is_off() { [[ -n "${off[$1]:-}" ]]; }
+
+save_config() {
+    local i tmp="$CONFIG_FILE.tmp"
+    {
+        printf '%s\n' '# Managed by hdmi-resolution-tui.'
+        printf 'enabled=%s\n' "$enabled"
+        printf 'target_width=%s\n' "$target_width"
+        printf 'target_height=%s\n' "$target_height"
+        printf 'extend_top_center=%s\n' "$extend_top_center"
+        # One line per display excluded from the mirror rule: key, then label.
+        for i in "${!d_key[@]}"; do
+            is_off "${d_key[i]}" && printf 'auto_off_display=%s %s\n' "${d_key[i]}" "${d_label[i]}"
+        done
+    } > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+}
+
+on_off() { if [[ "$1" == 1 ]]; then echo ON; else echo OFF; fi; }
+
+status_text() {
+    local i rule
+    printf 'Mirror rule %s: while a display mirrors the laptop screen, the\n' "$(on_off "$enabled")"
+    printf 'laptop screen uses %sx%s. Your own resolution is saved first and\n' "$target_width" "$target_height"
+    printf 'restored when mirroring ends.\n'
+    printf 'Extend rule %s: a single extended display is placed above the\n' "$(on_off "$extend_top_center")"
+    printf 'laptop screen, centred.\n\n'
+    if (( ${#d_key[@]} == 0 )); then
+        printf 'No external display connected.'
+        return
+    fi
+    printf 'Displays:'
+    for i in "${!d_key[@]}"; do
+        rule=on
+        is_off "${d_key[i]}" && rule=off
+        printf '\n  %s (%s): mirror rule %s' "${d_label[i]}" "${d_state[i]}" "$rule"
+    done
+}
+
+# Tallest box that fits the terminal, given the wanted height.
+fit_height() {
+    local rows
+    rows=$(tput lines 2>/dev/null) || rows=24
+    (( rows < $1 )) && echo "$rows" || echo "$1"
+}
+
+load_displays
+
+while :; do
+    menu_text="$(status_text)"
+    text_lines=$(wc -l <<< "$menu_text")
+    on_count=0
+    for i in "${!d_key[@]}"; do
+        is_off "${d_key[i]}" || on_count=$((on_count + 1))
+    done
+    choice=$(whiptail --title 'Display Rules (hdmi-resolution)' --menu -- "$menu_text" "$(fit_height $((text_lines + 15)))" 78 7 \
+        auto "Mirror rule, all displays: $(on_off "$enabled")" \
+        displays "Mirror rule per display: $on_count of ${#d_key[@]} on" \
+        target "Mirrored target: ${target_width}x${target_height}" \
+        extend "Extend rule (above, centred): $(on_off "$extend_top_center")" \
+        restore "Restore user mode: ON (always)" \
+        save 'Save and restart service' \
+        quit 'Exit without saving' 3>&1 1>&2 2>&3) || exit 0
+
+    case "$choice" in
+        auto)
+            default=()
+            [[ "$enabled" == 1 ]] || default=(--defaultno)
+            whiptail --title 'Mirror rule, all displays' "${default[@]}" --yesno -- 'Master switch for automatic resolution. When enabled, the laptop screen changes to the target mode only while an external display is connected AND Plasma is in mirror mode. This applies to every connector: HDMI, USB-C/DisplayPort, DVI, VGA and docks. Extended layouts never have their resolution changed.\n\nIndividual displays can be excluded under "Mirror rule per display".\n\nEnable the mirror rule?' 16 78
+            case $? in
+                0) enabled=1 ;;
+                1) enabled=0 ;;
+            esac
+            ;;
+        displays)
+            if (( ${#d_key[@]} == 0 )); then
+                whiptail --title 'Mirror rule per display' --msgbox -- 'No external display is connected, and none has been switched off before.\n\nConnect a display to switch the mirror rule on or off for it. Until then the master switch applies to every display, whatever its connector.' 12 78
+                continue
+            fi
+            items=()
+            for i in "${!d_key[@]}"; do
+                state=ON
+                is_off "${d_key[i]}" && state=OFF
+                items+=("$i" "${d_label[i]} (${d_state[i]})" "$state")
+            done
+            picked=$(whiptail --title 'Mirror rule per display' --notags --separate-output --checklist -- 'Ticked displays switch the laptop screen to the target mode while they mirror it; unticked displays leave it alone. A display is recognised by its EDID, so the setting follows it to any port. New displays start ticked.\n\nSpace toggles, Enter confirms.' "$(fit_height $((${#d_key[@]} + 14)))" 78 "${#d_key[@]}" "${items[@]}" 3>&1 1>&2 2>&3) || continue
+            for i in "${!d_key[@]}"; do
+                off[${d_key[i]}]=1
+            done
+            while read -r i; do
+                [[ "$i" =~ ^[0-9]+$ ]] && unset "off[${d_key[i]}]"
+            done <<< "$picked"
+            ;;
+        target)
+            target=$(whiptail --title 'Mirrored target mode' --default-item "${target_width}x${target_height}" --menu -- 'This is the laptop screen mode used while mirroring. It does not affect extended mode.' 14 70 4 \
+                1920x1080 '1080p (recommended)' \
+                2560x1440 '1440p' \
+                1280x720 '720p' 3>&1 1>&2 2>&3) || continue
+            target_width=${target%x*}
+            target_height=${target#*x}
+            ;;
+        extend)
+            default=()
+            [[ "$extend_top_center" == 1 ]] || default=(--defaultno)
+            whiptail --title 'Extend rule' "${default[@]}" --yesno -- 'When enabled, a single external display in extend mode is placed above the laptop screen, horizontally centred, each time extend mode starts (plugging in, leaving mirror mode, logging in). It works with any connector, resolution, scale and rotation.\n\nYou can still drag the screens elsewhere in System Settings; that layout is kept until extend mode next starts. With two or more external displays nothing is moved.\n\nEnable the extend rule?' 17 78
+            case $? in
+                0) extend_top_center=1 ;;
+                1) extend_top_center=0 ;;
+            esac
+            ;;
+        restore)
+            whiptail --title 'Restore user mode' --msgbox -- 'Always enabled: before entering mirror mode, the service records the panel mode currently selected by the user. When mirror mode ends, it restores that exact mode. The service never hardcodes the restore resolution.' 12 78
+            ;;
+        save)
+            save_config
+            if systemctl --user restart hdmi-resolution.service; then
+                result='The service has been restarted.'
+            else
+                result='WARNING: the service could not be restarted. Check: systemctl --user status hdmi-resolution.service'
+            fi
+            saved_text="Settings saved.\n\n$(status_text)\n\n$result"
+            whiptail --title 'Saved' --msgbox -- "$saved_text" "$(fit_height $((text_lines + 13)))" 78
+            exit 0
+            ;;
+        quit)
+            exit 0
+            ;;
+    esac
+done
