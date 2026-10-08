@@ -2,9 +2,9 @@
 # Stand-in for kscreen-doctor, used only by run-tests.sh.
 #
 # The fake display state lives in $MOCK_DIR/state.json in the same shape as
-# `kscreen-doctor -j`. Mode and position settings are applied to that file,
-# and, like KWin, every applied change rewrites kwinoutputconfig.json so the
-# service notices it. Every non-query call is appended to $MOCK_DIR/calls.log.
+# `kscreen-doctor -j`. Mode and position settings are applied to that file.
+# In a Wayland test every applied change also rewrites kwinoutputconfig.json,
+# as KWin does; in an X11 test the service notices through mock-xrandr. Every non-query call is appended to $MOCK_DIR/calls.log.
 #
 # Switches (create the file to turn on):
 #   $MOCK_DIR/broken      -j prints something that is not JSON
@@ -47,4 +47,5 @@ for arg in "$@"; do
     esac
 done
 printf '%s\n' "$json" > "$state.tmp" && mv "$state.tmp" "$state"
-date +%s%N > "$XDG_CONFIG_HOME/kwinoutputconfig.json"
+# KWin rewrites its config file after a change, but only under Wayland.
+[[ "${XDG_SESSION_TYPE:-}" == x11 ]] || date +%s%N > "$XDG_CONFIG_HOME/kwinoutputconfig.json"

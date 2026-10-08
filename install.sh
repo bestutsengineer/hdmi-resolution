@@ -21,6 +21,8 @@ if ((${#missing[@]})); then
     exit 1
 fi
 
+command -v xrandr > /dev/null || echo 'Note: xrandr is not installed. It is only needed in Plasma X11 sessions.'
+
 install -d "$bin_dir" "$unit_dir" "$config_dir"
 install -m 755 "$here/bin/hdmi-resolution" "$here/bin/hdmi-resolution-tui" "$bin_dir/"
 install -m 644 "$here/systemd/hdmi-resolution.service" "$unit_dir/"

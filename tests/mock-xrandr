@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Stand-in for xrandr, used only by run-tests.sh for the X11 cases.
+#
+#   --current           prints the fake display state, which is all the service
+#                       needs: something that changes when the layout changes
+#   --current --props   prints one EDID block per file in $MOCK_DIR/x11-edid/,
+#                       named after the output it belongs to
+set -u
+
+if [[ " $* " != *' --props '* ]]; then
+    cat "$MOCK_DIR/state.json"
+    exit 0
+fi
+
+for f in "$MOCK_DIR"/x11-edid/*; do
+    [[ -r "$f" ]] || continue
+    printf '%s connected (normal left inverted right x axis y axis)\n' "${f##*/}"
+    printf '\tEDID: \n'
+    { od -An -v -tx1 "$f" | tr -d ' \n' | fold -w 32; echo; } | sed 's/^/\t\t/'
+    printf '\tnon-desktop: 0 \n\t\trange: (0, 1)\n'
+done

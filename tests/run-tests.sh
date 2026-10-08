@@ -19,8 +19,8 @@ DELL_KEY="edid:$(md5sum < "$HERE/fixtures/dell-p2723de.edid" | cut -d' ' -f1)"
 HOSTILE_KEY="edid:$(md5sum < "$HERE/fixtures/hostile-name.edid" | cut -d' ' -f1)"
 
 # A web upload or a zip from some tools drops the executable bit.
-chmod +x "$DAEMON" "$TUI" "$HERE/mock-kscreen-doctor" 2>/dev/null
-for f in "$DAEMON" "$TUI" "$HERE/mock-kscreen-doctor"; do
+chmod +x "$DAEMON" "$TUI" "$HERE/mock-kscreen-doctor" "$HERE/mock-xrandr" 2>/dev/null
+for f in "$DAEMON" "$TUI" "$HERE/mock-kscreen-doctor" "$HERE/mock-xrandr"; do
     [[ -x "$f" ]] || { echo "not executable: $f" >&2; exit 2; }
 done
 
@@ -30,6 +30,19 @@ T=''
 daemon_pid=''
 
 export HDMI_RESOLUTION_KSCREEN_DOCTOR="$HERE/mock-kscreen-doctor"
+
+# The service picks its code path from the session type. Every test runs as a
+# Wayland session unless it calls x11_session, whatever session the suite
+# itself is started from.
+wayland_session() {
+    export XDG_SESSION_TYPE=wayland WAYLAND_DISPLAY=wayland-test
+    export HDMI_RESOLUTION_XRANDR=/bin/false
+}
+x11_session() {
+    export XDG_SESSION_TYPE=x11 HDMI_RESOLUTION_XRANDR="$HERE/mock-xrandr"
+    unset WAYLAND_DISPLAY
+}
+wayland_session
 
 # --- Fake display states ----------------------------------------------------
 
@@ -58,6 +71,8 @@ output() {
 state() { jq -cn '{outputs: $ARGS.positional}' --jsonargs "$@"; }
 # panel X Y [MODE-ID] [ENABLED]: the laptop screen, id 2, scale 1.25.
 panel() { output eDP-1 2 "${4:-true}" "$1" "$2" 1.25 1 0 "${3:-32}" "$PANEL_MODES"; }
+# The same panel as X11 reports it: no per-output scale.
+xpanel() { output eDP-1 2 "${4:-true}" "$1" "$2" 1 1 0 "${3:-32}" "$PANEL_MODES"; }
 
 # --- Harness ----------------------------------------------------------------
 
@@ -76,6 +91,7 @@ trap cleanup EXIT
 # Fresh config, state, mock and fake sysfs directories for one test.
 sandbox() {
     stop_daemon
+    wayland_session
     [[ -n "$T" ]] && rm -rf "$T"
     T=$(mktemp -d)
     export XDG_CONFIG_HOME="$T/config" XDG_STATE_HOME="$T/state" MOCK_DIR="$T/mock"
@@ -88,6 +104,10 @@ sandbox() {
 }
 
 edid() { mkdir -p "$T/drm/card1-$1" && cp "$HERE/fixtures/$2" "$T/drm/card1-$1/edid"; }
+# Under X11 the EDID is served by (the mock) xrandr, under the X output name.
+x11_edid() { mkdir -p "$MOCK_DIR/x11-edid" && cp "$HERE/fixtures/$2" "$MOCK_DIR/x11-edid/$1"; }
+display_mode_file() { saved_mode "$XDG_STATE_HOME/hdmi-resolution/displays/${1/:/-}.$2"; }
+last_call() { tail -n 1 "$MOCK_DIR/calls.log"; }
 config() { printf '%s\n' "$@" > "$XDG_CONFIG_HOME/hdmi-resolution/config"; }
 
 events() {
@@ -119,7 +139,8 @@ settle() {
 
 set_state() {
     printf '%s\n' "$1" > "$MOCK_DIR/state.json"
-    date +%s%N > "$XDG_CONFIG_HOME/kwinoutputconfig.json"
+    # Only the Wayland compositor rewrites this file; under X11 it never changes.
+    [[ "$XDG_SESSION_TYPE" == x11 ]] || date +%s%N > "$XDG_CONFIG_HOME/kwinoutputconfig.json"
 }
 
 # Start the daemon on an initial display state.
@@ -410,6 +431,139 @@ check 'well-formed display line still honoured' '2560x1600' "$(mode eDP-1)"
 check 'nothing in the config was executed' '' "$(find "$T" -name 'pwned-*')"
 check_alive
 
+# === X11 session ============================================================
+#
+# Under X11 a mirrored layout is two outputs at the same position, put there
+# by Plasma in the largest size both support. Plasma leaves the panel in that
+# mode afterwards; putting it back is this service's job.
+
+sandbox 'X11: Plasma unifies at the target size, then laptop only -> user mode restored'
+x11_session
+start "$(state "$(xpanel 0 0)")"
+check 'user mode tracked while alone' "$USER_MODE" "$(baseline)"
+check_log 'runs as an X11 session' 'Started: session=x11 .* watch=xrandr'
+change "$(state "$(xpanel 0 0 39)" "$(output HDMI-1 1 true 0 0 1 1 0 1 "$FHD_MODES")")"
+check 'mirror detected from the shared position' 1 "$(grep -c 'Layout changed: no-display -> mirror' "$T/daemon.log")"
+check 'nothing to change, Plasma already chose the target' 0 "$(calls)"
+check 'user mode saved for restore' "$USER_MODE" "$(pending)"
+check 'mirrored mode not mistaken for the user mode' "$USER_MODE" "$(baseline)"
+change "$(state "$(xpanel 0 0 39)" "$(output HDMI-1 1 false 0 0 1 1 0 1 "$FHD_MODES")")"
+check 'user mode restored' '2560x1600' "$(mode eDP-1)"
+check 'pending restore cleared' 'none' "$(pending)"
+check 'one kscreen-doctor call' 1 "$(calls)"
+
+sandbox 'X11: unplugged while mirrored and Plasma restored the laptop layout itself'
+x11_session
+start "$(state "$(xpanel 0 0)")"
+change "$(state "$(xpanel 0 0 39)" "$(output HDMI-1 1 true 0 0 1 1 0 1 "$FHD_MODES")")"
+change "$(state "$(xpanel 0 0)")"
+check 'pending restore cleared' 'none' "$(pending)"
+check 'no kscreen-doctor call needed' 0 "$(calls)"
+check_log 'logged as already in place' 'User modes are already back in place'
+
+sandbox 'X11: service started while mirrored -> restore still owed from the saved user mode'
+x11_session
+printf '2560\t1600\t59.99399948120117\n' > "$XDG_STATE_HOME/hdmi-resolution/baseline-mode"
+start "$(state "$(xpanel 0 0 39)" "$(output HDMI-1 1 true 0 0 1 1 0 1 "$FHD_MODES")")"
+check 'user mode saved for restore' "$USER_MODE" "$(pending)"
+check 'no kscreen-doctor call' 0 "$(calls)"
+change "$(state "$(xpanel 0 0 39)" "$(output HDMI-1 1 true 1920 0 1 1 0 1 "$FHD_MODES")")"
+check 'user mode restored on switching to extend' '2560x1600' "$(mode eDP-1)"
+check 'display then placed above the restored panel' '320,0 0,1080' "$(pos HDMI-1) $(pos eDP-1)"
+
+sandbox 'X11: bigger display -> panel and display set to the target together, both restored'
+x11_session
+x11_edid HDMI-1 dell-p2723de.edid
+start "$(state "$(xpanel 0 0)" "$(output HDMI-1 1 true 2560 0 1 1 0 1 "$QHD_MODES")")"
+check 'placed above on start' '0,0 0,1440' "$(pos HDMI-1) $(pos eDP-1)"
+check 'display mode tracked in extend mode' '2560 1440 59.951' "$(display_mode_file "$DELL_KEY" baseline)"
+# Plasma's unify: both at 0,0 in the largest common size, 2560x1440.
+change "$(state "$(xpanel 0 0 38)" "$(output HDMI-1 1 true 0 0 1 1 0 1 "$QHD_MODES")")"
+check 'panel at the target' '1920x1080' "$(mode eDP-1)"
+check 'display at the target' '1920x1080' "$(mode HDMI-1)"
+check 'both changed in one call' 'output.eDP-1.mode.39 output.HDMI-1.mode.4' "$(last_call)"
+check 'user mode saved for restore' "$USER_MODE" "$(pending)"
+check 'display mode saved for restore' '2560 1440 59.951' "$(display_mode_file "$DELL_KEY" pending)"
+# Plasma's extend preset keeps the mirrored modes and puts the display beside the panel.
+change "$(state "$(xpanel 0 0 39)" "$(output HDMI-1 1 true 1920 0 1 1 0 4 "$QHD_MODES")")"
+check 'panel restored' '2560x1600' "$(mode eDP-1)"
+check 'display restored' '2560x1440' "$(mode HDMI-1)"
+check 'pending restores cleared' 'none none' "$(pending) $(display_mode_file "$DELL_KEY" pending)"
+check 'placed using the restored sizes' '0,0 0,1440' "$(pos HDMI-1) $(pos eDP-1)"
+
+sandbox 'X11: display never seen in extend mode goes back to the size Plasma mirrored at'
+x11_session
+x11_edid HDMI-1 dell-p2723de.edid
+start "$(state "$(xpanel 0 0)")"
+change "$(state "$(xpanel 0 0 38)" "$(output HDMI-1 1 true 0 0 1 1 0 1 "$QHD_MODES")")"
+check 'both at the target' '1920x1080 1920x1080' "$(mode eDP-1) $(mode HDMI-1)"
+change "$(state "$(xpanel 0 0 39)" "$(output HDMI-1 1 true 1920 0 1 1 0 4 "$QHD_MODES")")"
+check 'panel restored' '2560x1600' "$(mode eDP-1)"
+check 'display back at the mirrored size' '2560x1440' "$(mode HDMI-1)"
+
+sandbox 'X11: display without the target size -> left as Plasma chose, still restored'
+x11_session
+config 'enabled=1' 'target_width=2560' 'target_height=1440'
+start "$(state "$(xpanel 0 0)")"
+change "$(state "$(xpanel 0 0 39)" "$(output HDMI-1 1 true 0 0 1 1 0 1 "$FHD_MODES")")"
+check 'no kscreen-doctor call' 0 "$(calls)"
+check 'panel left at the shared size' '1920x1080' "$(mode eDP-1)"
+check_log 'reason logged' 'HDMI-1 has no 2560x1440 mode; mirroring stays at the size Plasma chose'
+change "$(state "$(xpanel 0 0 39)" "$(output HDMI-1 1 false 0 0 1 1 0 1 "$FHD_MODES")")"
+check 'user mode restored' '2560x1600' "$(mode eDP-1)"
+
+sandbox 'X11: rule switched off for the display -> a mirrored layout is left alone'
+x11_session
+x11_edid HDMI-1 dell-p2723de.edid
+config 'enabled=1' "auto_off_display=$DELL_KEY DELL P2723DE [HDMI]"
+start "$(state "$(xpanel 0 0)")"
+change "$(state "$(xpanel 0 0 38)" "$(output HDMI-1 1 true 0 0 1 1 0 1 "$QHD_MODES")")"
+check 'no kscreen-doctor call' 0 "$(calls)"
+check 'nothing saved for restore' 'none' "$(pending)"
+check 'mirrored mode not tracked as the user mode' "$USER_MODE" "$(baseline)"
+check_log 'logged as manual mirroring' 'Layout changed: no-display -> mirror-manual \[HDMI-1: DELL P2723DE, HDMI\]'
+
+sandbox 'X11: rule switched off while mirrored -> restore waits until mirroring ends'
+x11_session
+config 'enabled=0'
+printf '2560\t1600\t59.99399948120117\n' > "$XDG_STATE_HOME/hdmi-resolution/pending-mode"
+start "$(state "$(xpanel 0 0 39)" "$(output HDMI-1 1 true 0 0 1 1 0 1 "$FHD_MODES")")"
+check 'panel not pulled out of the mirrored size' '1920x1080' "$(mode eDP-1)"
+check 'restore still owed' "$USER_MODE" "$(pending)"
+change "$(state "$(xpanel 0 0 39)" "$(output HDMI-1 1 false 0 0 1 1 0 1 "$FHD_MODES")")"
+check 'user mode restored once mirroring ends' '2560x1600' "$(mode eDP-1)"
+
+sandbox 'X11: kscreen-doctor refuses the restore -> still owed, no retry loop'
+x11_session
+start "$(state "$(xpanel 0 0)")"
+change "$(state "$(xpanel 0 0 39)" "$(output HDMI-1 1 true 0 0 1 1 0 1 "$FHD_MODES")")"
+touch "$MOCK_DIR/fail-apply"
+change "$(state "$(xpanel 0 0 39)" "$(output HDMI-1 1 false 0 0 1 1 0 1 "$FHD_MODES")")"
+check 'exactly one attempt' 1 "$(calls)"
+check 'restore still owed' "$USER_MODE" "$(pending)"
+check 'mirrored mode not tracked as the user mode' "$USER_MODE" "$(baseline)"
+rm "$MOCK_DIR/fail-apply"
+# Under X11 only a real change wakes the service, so this state differs.
+change "$(state "$(xpanel 0 0 39)" "$(output HDMI-1 1 false 10 0 1 1 0 1 "$FHD_MODES")")"
+check 'restored at the next display change' '2560x1600' "$(mode eDP-1)"
+check_alive
+
+sandbox 'X11: display identified through the X server, not sysfs'
+x11_session
+stop_daemon
+x11_edid HDMI-1 dell-p2723de.edid
+set_state "$(state "$(xpanel 0 0 39)" "$(output HDMI-1 1 true 0 0 1 1 0 1 "$FHD_MODES")" "$(output DP-1 3 true 1920 0 1 1 0 1 "$FHD_MODES")")"
+listing=$("$DAEMON" list-displays | tr '\t' '|')
+check 'named and keyed from the EDID that X reports' "$DELL_KEY|HDMI-1|HDMI|DELL P2723DE|mirrored|on" "$(grep '|HDMI-1|' <<< "$listing")"
+check 'display X has no EDID for' 'connector:DP-1|DP-1|USB-C/DisplayPort|Unidentified display|extended|on' "$(grep '|DP-1|' <<< "$listing")"
+check 'status names the session' 'Session:      x11' "$("$DAEMON" status 2>&1 | grep '^Session')"
+
+sandbox 'Wayland session with a stale XDG_SESSION_TYPE=x11 still takes the Wayland path'
+export XDG_SESSION_TYPE=x11
+start "$(state "$(panel 0 0)" "$(output DP-3 1 true 2048 0 1 1 0 1 "$QHD_MODES")")"
+check_log 'runs as a Wayland session' 'Started: session=wayland '
+check 'extend rule works off the KWin file' '0,0 256,1440' "$(pos DP-3) $(pos eDP-1)"
+
 # === Display identification =================================================
 
 sandbox 'list-displays identifies and labels every connector type'
@@ -460,7 +614,7 @@ if command -v tmux > /dev/null && command -v whiptail > /dev/null; then
     start_tui() {
         tm kill-server 2>/dev/null
         tm new-session -d -s tui -x 100 -y 40 \
-            "env PATH='$T/bin:$PATH' XDG_CONFIG_HOME='$XDG_CONFIG_HOME' XDG_STATE_HOME='$XDG_STATE_HOME' MOCK_DIR='$MOCK_DIR' HDMI_RESOLUTION_KSCREEN_DOCTOR='$HDMI_RESOLUTION_KSCREEN_DOCTOR' HDMI_RESOLUTION_DRM_DIR='$HDMI_RESOLUTION_DRM_DIR' TERM=xterm '$TUI'"
+            "env PATH='$T/bin:$PATH' XDG_CONFIG_HOME='$XDG_CONFIG_HOME' XDG_STATE_HOME='$XDG_STATE_HOME' MOCK_DIR='$MOCK_DIR' HDMI_RESOLUTION_KSCREEN_DOCTOR='$HDMI_RESOLUTION_KSCREEN_DOCTOR' HDMI_RESOLUTION_DRM_DIR='$HDMI_RESOLUTION_DRM_DIR' HDMI_RESOLUTION_XRANDR='$HDMI_RESOLUTION_XRANDR' XDG_SESSION_TYPE='$XDG_SESSION_TYPE' WAYLAND_DISPLAY='${WAYLAND_DISPLAY:-}' TERM=xterm '$TUI'"
     }
 
     sandbox 'TUI: menus, per-display switch, extend switch, save'

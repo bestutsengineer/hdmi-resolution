@@ -1,7 +1,7 @@
 # hdmi-resolution
 
-Two display rules for laptops running KDE Plasma 6 on Wayland, with a small
-terminal menu to control them.
+Two display rules for laptops running KDE Plasma 6, in a Wayland or an X11
+session, with a small terminal menu to control them.
 
 | Rule | When it acts | What it does |
 |---|---|---|
@@ -24,8 +24,10 @@ needs root.
 
 ## Requirements
 
-- KDE Plasma 6 on Wayland (developed and tested on Plasma 6.7, Fedora 44)
+- KDE Plasma 6, Wayland or X11 session (developed and tested on Plasma 6.7,
+  Fedora 44)
 - `kscreen-doctor` (part of Plasma), `jq`, `whiptail` (package `newt`)
+- `xrandr`, only in X11 sessions
 - `bash`, coreutils, systemd user services
 - `tmux`, only for running the test suite
 
@@ -96,6 +98,24 @@ Nothing is written until you choose "Save and restart service".
   switched on.
 - Switching the rule off while mirroring puts the laptop screen back at once.
 
+**Mirror rule in an X11 session**
+
+Plasma mirrors differently under X11, and the rule adapts:
+
+- "Unify outputs" puts both screens at the same position in the largest size
+  they both support, and Plasma then leaves the laptop screen in that size
+  after mirroring ends. The service puts your own mode back, whoever changed
+  it.
+- X11 cannot scale a mirrored screen, so screens of different sizes would show
+  different parts of the desktop. The target is therefore applied to the
+  laptop screen and the mirroring display together. If the display does not
+  offer the target size, both stay at the size Plasma chose.
+- A display the service changed is put back as well when mirroring ends: to
+  the mode it last had in extend mode, or else to the size Plasma mirrored at.
+- With the rule switched off, a mirrored layout is left exactly as Plasma made
+  it. Switching the rule off while mirroring restores your mode when mirroring
+  ends, not at once.
+
 **Extend rule**
 
 - It is applied each time extend mode starts: plugging in, leaving mirror
@@ -132,8 +152,10 @@ keeps its default (both rules on, 1920x1080).
 
 ## Limitations
 
-- Plasma 6 on Wayland only. It has not been tried elsewhere; without Plasma's
-  `kscreen-doctor` answering, the service does nothing.
+- KDE Plasma 6 only. Without Plasma's `kscreen-doctor` answering, the service
+  does nothing.
+- Under X11 it expects output names in the form the standard modesetting
+  driver uses (`eDP-1`, `HDMI-1`, `DP-1`).
 - The extend rule overrides "Extend to left/right" chosen from Plasma's
   display switcher (Meta+P), because that choice also starts extend mode.
   Switch the rule off in the menu if you want those.
@@ -142,8 +164,9 @@ keeps its default (both rules on, 1920x1080).
 - USB-C displays use DisplayPort signalling and the kernel names them `DP-n`,
   the same as a full-size DisplayPort socket, so both are labelled
   `USB-C/DisplayPort`.
-- The service relies on KWin rewriting `~/.config/kwinoutputconfig.json` when
-  the display configuration changes. See [docs/DESIGN.md](docs/DESIGN.md).
+- Under Wayland the service relies on KWin rewriting
+  `~/.config/kwinoutputconfig.json` when the display configuration changes.
+  See [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Security notes
 
@@ -151,15 +174,17 @@ keeps its default (both rules on, 1920x1080).
   The service unit sets `NoNewPrivileges=yes`.
 - The only programs it controls are `kscreen-doctor` (to read the layout and
   to set a mode or position) and, from the menu, `systemctl --user restart`.
+  Under X11 it also runs `xrandr --current`, which only reads.
 - The config and state files are parsed as data and validated; they are never
   sourced or evaluated.
 - Monitor names come from the monitor's own EDID and are therefore untrusted.
   They are reduced to printable ASCII, passed to `whiptail` behind `--`, and
   never reach a shell parser. Output names are checked before being used in a
   path.
-- `HDMI_RESOLUTION_KSCREEN_DOCTOR` and `HDMI_RESOLUTION_DRM_DIR` are test
-  hooks. They redirect the service to a different program and directory, so
-  do not set them in the service's environment.
+- `HDMI_RESOLUTION_KSCREEN_DOCTOR`, `HDMI_RESOLUTION_XRANDR` and
+  `HDMI_RESOLUTION_DRM_DIR` are test hooks. They redirect the service to
+  different programs and a different directory, so do not set them in the
+  service's environment.
 
 Found a problem? Please open an issue.
 
@@ -170,9 +195,10 @@ bash tests/run-tests.sh              # tests the scripts in bin/
 bash tests/run-tests.sh ~/.local/bin # tests the installed copies
 ```
 
-The suite takes about three minutes and never touches real displays, settings
-or services: `kscreen-doctor` is replaced by a mock and all paths point at
-temporary directories. Both scripts are `shellcheck`-clean.
+The suite takes about five minutes and never touches real displays, settings
+or services: `kscreen-doctor` and `xrandr` are replaced by mocks and all paths
+point at temporary directories. It covers both session types, whichever one
+you run it from. Both scripts are `shellcheck`-clean.
 
 How it works, the design constraints and the things that will bite when you
 change it are in [docs/DESIGN.md](docs/DESIGN.md).

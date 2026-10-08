@@ -2,8 +2,8 @@
 # shellcheck disable=SC2016  # jq programs are single-quoted on purpose
 set -u
 
-# Plasma/Wayland display rules for the laptop panel and external displays of
-# any connector type (HDMI, USB-C/DisplayPort, DVI, VGA, ...).
+# KDE Plasma display rules (Wayland and X11) for the laptop panel and external
+# displays of any connector type (HDMI, USB-C/DisplayPort, DVI, VGA, ...).
 #
 #   Mirror rule: while an external display mirrors the panel, the panel is
 #     switched to the configured target mode. The user's own mode is restored
@@ -27,6 +27,16 @@ PNP_IDS=/usr/share/hwdata/pnp.ids
 # Test hooks: the test suite points these at a mock and a fake sysfs tree.
 KSCREEN_DOCTOR="${HDMI_RESOLUTION_KSCREEN_DOCTOR:-kscreen-doctor}"
 DRM_DIR="${HDMI_RESOLUTION_DRM_DIR:-/sys/class/drm}"
+XRANDR="${HDMI_RESOLUTION_XRANDR:-xrandr}"
+
+# Plasma on X11 needs its own change trigger, EDID source and mirror handling
+# (see the X11 section below). Anything that is not clearly an X11 session is
+# treated as Wayland, so the Wayland behaviour never depends on this test.
+if [[ "${XDG_SESSION_TYPE:-}" == x11 && -z "${WAYLAND_DISPLAY:-}" ]]; then
+    SESSION=x11
+else
+    SESSION=wayland
+fi
 
 log() {
     printf '[%s] %s\n' "$(date '+%F %T%z')" "$*" >&2
@@ -139,10 +149,48 @@ edid_file() {
     return 1
 }
 
+# X11 names outputs differently from the kernel (its HDMI-1 is HDMI-A-1 in
+# sysfs), so under X11 the EDID comes from the X server, as one hex string.
+# --current reads the server's cached state; it never probes the outputs.
+x11_edid_hex() {
+    timeout 10 "$XRANDR" --current --props 2>/dev/null | OUTPUT="$1" awk '
+        /^[^ \t]/ { grab = 0; cur = $1 }
+        cur == ENVIRON["OUTPUT"] && /^\tEDID:/ { grab = 1; next }
+        grab && /^\t\t[0-9a-fA-F]+$/ { printf "%s", $1; next }
+        { grab = 0 }'
+}
+
+# The display's EDID as decimal bytes.
+edid_bytes() {
+    local f hex i
+    if [[ "$SESSION" == x11 ]]; then
+        hex=$(x11_edid_hex "$1")
+        if (( ${#hex} >= 256 && ${#hex} % 2 == 0 )); then
+            for (( i = 0; i < ${#hex}; i += 2 )); do
+                printf '%d ' "0x${hex:i:2}"
+            done
+            return 0
+        fi
+    fi
+    f=$(edid_file "$1") && od -An -v -tu1 "$f" 2>/dev/null
+}
+
 # Stable identity of a display: the hash of its EDID, which is the same value
-# KWin stores as edidHash, so it follows the monitor from port to port.
+# KWin stores as edidHash, so it follows the monitor from port to port and is
+# the same in a Wayland and an X11 session.
 display_key() {
-    local f sum
+    local f sum hex i esc=''
+    if [[ "$SESSION" == x11 ]]; then
+        hex=$(x11_edid_hex "$1")
+        if (( ${#hex} >= 256 && ${#hex} % 2 == 0 )); then
+            # Back to the raw bytes, so the hash equals the one of the sysfs file.
+            for (( i = 0; i < ${#hex}; i += 2 )); do
+                esc+="\\x${hex:i:2}"
+            done
+            sum=$(printf '%b' "$esc" | md5sum | cut -d' ' -f1)
+            [[ "$sum" =~ ^[0-9a-f]{32}$ ]] && { printf 'edid:%s\n' "$sum"; return 0; }
+        fi
+    fi
     if f=$(edid_file "$1"); then
         sum=$(md5sum < "$f" 2>/dev/null | cut -d' ' -f1)
         [[ "$sum" =~ ^[0-9a-f]{32}$ ]] && { printf 'edid:%s\n' "$sum"; return 0; }
@@ -152,11 +200,9 @@ display_key() {
 
 # Human-readable model: the EDID monitor name, else vendor and product code.
 display_model() {
-    local f off i ch name='' pnp vendor
+    local off i ch name='' pnp vendor
     local -a b=()
-    if f=$(edid_file "$1"); then
-        read -r -d '' -a b < <(od -An -v -tu1 "$f" 2>/dev/null)
-    fi
+    read -r -d '' -a b < <(edid_bytes "$1")
     if (( ${#b[@]} < 128 )); then
         echo 'Unidentified display'
         return 0
@@ -305,6 +351,172 @@ restore_user_mode() {
     refresh_snapshot
 }
 
+# --- X11 --------------------------------------------------------------------
+#
+# Plasma's "Unify outputs" works differently under X11. It puts every output
+# at 0,0 in the largest size they all support, changing the panel's mode by
+# itself, and it remembers that mode per output, so the panel stays there
+# after mirroring ends. Nothing scales a mirrored output either: outputs of
+# different sizes at 0,0 simply show different parts of the desktop. So here
+#   - the target is applied to the panel and the mirroring displays together,
+#     or not at all;
+#   - the modes they had before are restored when mirroring ends, including
+#     those of the external displays;
+#   - while anything mirrors the panel, no mode is tracked as the user's.
+
+output_mode_id() {
+    snap --arg n "$1" '.outputs[] | select(.name == $n) | .currentModeId'
+}
+
+output_mode_spec() {
+    snap --arg n "$1" "$JQ_DEFS"'
+      .outputs[] | select(.name == $n) | current_mode
+      | [.size.width, .size.height, .refreshRate] | @tsv'
+}
+
+output_mode_id_for_size() {
+    snap --arg n "$1" --argjson width "$2" --argjson height "$3" "$JQ_DEFS"'
+      .outputs[] | select(.name == $n) | (current_mode | .refreshRate) as $now
+      | [.modes[] | select(.size.width == $width and .size.height == $height)]
+      | sort_by((.refreshRate - $now) | fabs) | .[0].id // empty'
+}
+
+output_mode_id_for_spec() {
+    snap --arg n "$1" --argjson width "$2" --argjson height "$3" --argjson refresh "$4" '
+      .outputs[] | select(.name == $n)
+      | [.modes[] | select(.size.width == $width and .size.height == $height
+                           and ((.refreshRate - $refresh) | fabs) < 0.2)]
+      | sort_by((.refreshRate - $refresh) | fabs) | .[0].id // empty'
+}
+
+# Where the mode of an external display is remembered: $1 is its key, $2 is
+# "baseline" (what the user runs it at) or "pending" (what to put back).
+display_state_file() {
+    [[ "$1" =~ ^(edid|connector):([A-Za-z0-9_.-]+)$ ]] || return 1
+    printf '%s/displays/%s-%s.%s\n' "$STATE_DIR" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$2"
+}
+
+# On entering mirror mode, note what each mirroring display has to go back to:
+# the mode it was last seen with in extend mode, else the one it has now.
+x11_save_display_pendings() {
+    local -a names
+    local name key base pend spec width height refresh
+    read -r -a names <<< "$mirror_names"
+    for name in "${names[@]}"; do
+        key=$(display_key "$name")
+        pend=$(display_state_file "$key" pending) || continue
+        base=$(display_state_file "$key" baseline)
+        if [[ -r "$base" ]]; then
+            spec=$(<"$base")
+        elif [[ -r "$pend" ]]; then
+            continue
+        else
+            spec=$(output_mode_spec "$name")
+        fi
+        read -r width height refresh <<< "$spec"
+        valid_mode_spec "$width" "$height" "$refresh" || continue
+        mkdir -p "$STATE_DIR/displays"
+        printf '%s\n' "$spec" > "$pend"
+    done
+}
+
+x11_apply_mirror_mode() {
+    local -a names args=()
+    local name mode_id
+    mode_id=$(panel_mode_id_for_size "$target_width" "$target_height")
+    if [[ -z "$mode_id" ]]; then
+        log "ERROR: $panel has no ${target_width}x${target_height} mode"
+        return 1
+    fi
+    [[ "$mode_id" == "$(output_mode_id "$panel")" ]] || args+=("output.$panel.mode.$mode_id")
+    read -r -a names <<< "$mirror_names"
+    for name in "${names[@]}"; do
+        mode_id=$(output_mode_id_for_size "$name" "$target_width" "$target_height")
+        if [[ -z "$mode_id" ]]; then
+            log "$name has no ${target_width}x${target_height} mode; mirroring stays at the size Plasma chose"
+            return 0
+        fi
+        [[ "$mode_id" == "$(output_mode_id "$name")" ]] || args+=("output.$name.mode.$mode_id")
+    done
+    if (( ${#args[@]} == 0 )); then
+        log "Mirroring is already at ${target_width}x${target_height}"
+        return 0
+    fi
+    if doctor "${args[@]}" >/dev/null; then
+        log "Applied mirrored mode ${target_width}x${target_height} (${args[*]})"
+        refresh_snapshot
+    else
+        log "ERROR: kscreen-doctor failed applying the mirrored mode (${args[*]})"
+        return 1
+    fi
+}
+
+# Outside mirror mode: put back every mode that is still owed, in a single
+# kscreen-doctor call, or, when nothing is owed, track the modes in use.
+x11_restore_or_track() {
+    local -a names args=() settled=()
+    local name key base pend spec width height refresh mode_id
+    if [[ -r "$PENDING_FILE" ]]; then
+        read -r width height refresh < "$PENDING_FILE"
+        if ! valid_mode_spec "$width" "$height" "$refresh"; then
+            log 'ERROR: discarding unreadable pending user mode'
+            rm -f "$PENDING_FILE"
+        else
+            mode_id=$(panel_mode_id_for_spec "$width" "$height" "$refresh")
+            if [[ -z "$mode_id" ]]; then
+                log "ERROR: saved user mode ${width}x${height}@${refresh} is unavailable"
+            else
+                settled+=("$PENDING_FILE")
+                [[ "$mode_id" == "$(output_mode_id "$panel")" ]] || args+=("output.$panel.mode.$mode_id")
+            fi
+        fi
+    fi
+    read -r -a names <<< "$ext_names"
+    for name in "${names[@]}"; do
+        key=$(display_key "$name")
+        pend=$(display_state_file "$key" pending) || continue
+        [[ -r "$pend" ]] || continue
+        read -r width height refresh < "$pend"
+        mode_id=''
+        valid_mode_spec "$width" "$height" "$refresh" \
+            && mode_id=$(output_mode_id_for_spec "$name" "$width" "$height" "$refresh")
+        if [[ -z "$mode_id" ]]; then
+            log "ERROR: saved mode of $name is unavailable; forgetting it"
+            rm -f "$pend"
+            continue
+        fi
+        settled+=("$pend")
+        [[ "$mode_id" == "$(output_mode_id "$name")" ]] || args+=("output.$name.mode.$mode_id")
+    done
+    if (( ${#args[@]} )); then
+        if doctor "${args[@]}" >/dev/null; then
+            log "Restored user modes (${args[*]})"
+            rm -f "${settled[@]}"
+            refresh_snapshot
+        else
+            log "ERROR: kscreen-doctor failed restoring user modes (${args[*]})"
+        fi
+        return 0
+    fi
+    if (( ${#settled[@]} )); then
+        log 'User modes are already back in place'
+        rm -f "${settled[@]}"
+    fi
+    # A restore that could not be done is still owed: track nothing.
+    [[ -r "$PENDING_FILE" ]] && return 0
+    save_baseline_mode
+    for name in "${names[@]}"; do
+        key=$(display_key "$name")
+        base=$(display_state_file "$key" baseline) || continue
+        spec=$(output_mode_spec "$name")
+        read -r width height refresh <<< "$spec"
+        valid_mode_spec "$width" "$height" "$refresh" || continue
+        [[ -r "$base" && "$(<"$base")" == "$spec" ]] && continue
+        mkdir -p "$STATE_DIR/displays"
+        printf '%s\n' "$spec" > "$base"
+    done
+}
+
 # --- Extend rule ------------------------------------------------------------
 
 last_extend_sig=''
@@ -372,20 +584,37 @@ describe_externals() {
     printf '%s' "$out"
 }
 
+# Something cheap that changes whenever the display configuration does.
+# Under Wayland KWin rewrites its config file. Under X11 nothing equivalent is
+# written on every change, so the X server's cached state is read instead.
+watch_stamp() {
+    if [[ "$SESSION" == x11 ]]; then
+        timeout 10 "$XRANDR" --current 2>/dev/null | cksum
+    elif [[ -r "$WATCH_FILE" ]]; then
+        stat -c '%y:%s:%i' "$WATCH_FILE" 2>/dev/null || true
+    else
+        echo 'missing'
+    fi
+}
+
 run_daemon() {
-    local last_watch_stamp='' watch_stamp state last_state='' displays
-    log "Started: mirror_rule=$enabled target=${target_width}x${target_height} extend_rule=$extend_top_center displays_off=${#auto_off_displays[@]} watch=$WATCH_FILE"
+    local last_stamp='' stamp next state last_state='' displays watch="$WATCH_FILE"
+    [[ "$SESSION" == x11 ]] && watch='xrandr'
+    log "Started: session=$SESSION mirror_rule=$enabled target=${target_width}x${target_height} extend_rule=$extend_top_center displays_off=${#auto_off_displays[@]} watch=$watch"
     while :; do
-        if [[ -r "$WATCH_FILE" ]]; then
-            watch_stamp=$(stat -c '%y:%s:%i' "$WATCH_FILE" 2>/dev/null || true)
-        else
-            watch_stamp='missing'
-        fi
-        if [[ "$watch_stamp" == "$last_watch_stamp" ]]; then
+        stamp=$(watch_stamp)
+        if [[ "$stamp" == "$last_stamp" ]]; then
             sleep 1
             continue
         fi
-        last_watch_stamp="$watch_stamp"
+        if [[ "$SESSION" == x11 ]]; then
+            # Wait until the X server has been quiet for a second, so that a
+            # change Plasma makes in several steps is only looked at once.
+            while sleep 1; next=$(watch_stamp); [[ "$next" != "$stamp" ]]; do
+                stamp=$next
+            done
+        fi
+        last_stamp="$stamp"
         refresh_snapshot
         state=$layout
         # Mirroring with the rule switched off: the panel mode is the user's.
@@ -405,13 +634,22 @@ run_daemon() {
             mirror)
                 if [[ "$last_state" != mirror ]]; then
                     save_pending_mode
-                    apply_mirror_mode
+                    if [[ "$SESSION" == x11 ]]; then
+                        x11_save_display_pendings
+                        x11_apply_mirror_mode
+                    else
+                        apply_mirror_mode
+                    fi
                 fi
                 ;;
             *)
                 # no-display, extend, mirror-manual: finish any restore that
                 # is still owed, otherwise track the user's current setting.
-                if [[ -r "$PENDING_FILE" ]]; then
+                if [[ "$SESSION" == x11 ]]; then
+                    # X11 cannot mirror outputs of different sizes, so a
+                    # mirrored layout is left alone even with the rule off.
+                    [[ "$state" == mirror-manual ]] || x11_restore_or_track
+                elif [[ -r "$PENDING_FILE" ]]; then
                     restore_user_mode
                 else
                     save_baseline_mode
@@ -447,6 +685,7 @@ show_status() {
     local key name kind model state auto found=0
     refresh_snapshot
     printf 'Service:      %s\n' "$(systemctl --user is-active hdmi-resolution.service 2>/dev/null)"
+    printf 'Session:      %s\n' "$SESSION"
     printf 'Layout:       %s\n' "$layout"
     printf 'Panel:        %s %s\n' "${panel:-none}" "$(snap "$JQ_DEFS"'
       panel | select(. != null) | (current_mode) as $m | logical as $l
